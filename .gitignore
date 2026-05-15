@@ -1,0 +1,12 @@
+.env
+.env.local
+node_modules/
+.next/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/storage/
+backend/failed_writes/
+*.log
