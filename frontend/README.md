@@ -1,43 +1,72 @@
 # Prism Frontend — Dashboard + Personalized Landing Pages
 
-Next.js 15 application serving two functions: an internal dashboard for running the enrichment pipeline and reviewing results, and public-facing personalized landing pages rendered from Sanity CMS content.
+Next.js 15 application serving two functions: an internal dashboard for running the enrichment pipeline and reviewing results, and public-facing personalized landing pages. Landing content is **API-first** (`GET /api/landing/{domain}` → stored `landing_page_content`), with **Sanity GROQ + `LegacyLanding`** when that JSON is unavailable.
 
 ## Dashboard (`/`)
 
-- **Single URL submission** — enter a company URL, the pipeline runs end-to-end (scrape → enrich → Sanity → HubSpot), and results appear on completion.
-- **Batch CSV upload** — upload a CSV with a `url`, `website`, `domain`, or `company_url` column to process multiple companies concurrently.
-- **Recent runs** — lists all completed pipeline runs with links to per-domain detail pages and external systems (Sanity Studio, HubSpot record, landing page).
+- **Single URL submission** — enter a company URL; the pipeline runs end-to-end (scrape → research → enrichment → optional landing JSON → Sanity → HubSpot); the UI polls status until completion.
+- **Batch CSV upload** — upload a CSV with a `url`, `website`, `domain`, or `company_url` column to process multiple companies concurrently (`POST /api/pipeline/batch`).
+- **Recent runs** — lists pipeline runs with links to per-domain detail pages and external systems (Sanity Studio, HubSpot record, landing page).
 
 ### Detail page (`/results/[domain]`)
 
-Server component that fetches the full pipeline result from the backend API. Displays enrichment fields (ICP tier, intent score, pain points, intent signals, content blocks), scrape metadata, and quick links to the Sanity document, HubSpot record, and rendered landing page.
+Server component ([`src/app/results/[domain]/page.tsx`](src/app/results/[domain]/page.tsx)) that loads [`GET /api/results/{domain}`](src/lib/api.ts) (`INTERNAL_API_URL` when SSR). Shows enrichment fields (ICP tier, intent score, pain points, intent signals, Gemini-generated content blocks), scrape metadata, stage summary, and quick links to Sanity, HubSpot, and `/lp/{slug}`.
+
+**Slug routing:** Domains may appear hyphenated in the path; the page resolves hyphen ↔ dot consistently with landing routes.
 
 ## Landing Pages (`/lp/[slug]`)
 
-Personalized, account-specific marketing pages rendered at request time from Sanity. Each page is composed of five sections assembled from the `accountResearchProfile` document:
+Server route ([`src/app/lp/[slug]/page.tsx`](src/app/lp/[slug]/page.tsx)).
 
-1. **Hero** — personalized headline and value proposition
-2. **Pain** — pain point paragraph with detected pain points and evidence
-3. **Social proof** — CertifyOS case studies matched by `organization_type`
-4. **Product** — feature details from the best-fit `productPageContent` document
-5. **CTA** — personalized call-to-action with supporting proof point
+### Dual-source content
 
-**Access control:** When `LANDING_PAGE_SECRET` is set, pages require an HMAC token (`?t={token}`). Without the secret, all pages are public.
+1. **Primary:** [`getLandingContentByDomain`](src/lib/api.ts) → backend **`/api/landing/{domain}`** → rich **`LandingPageContent`** JSON from the pipeline run.
+2. **Fallback:** [`getLandingPageByDomain`](src/lib/sanity.ts) → GROQ on **`accountResearchProfile`** → passes data to **`LegacyLanding`** (~5-section layout aligned with older Sanity-only docs).
 
-**Preview:** `?preview=true` adds a "Draft — Internal Preview Only" banner for SDR review before sharing.
+If **both** sources are empty, the route returns **404** (`notFound()`).
+
+### Twelve-section rich layout
+
+When API landing JSON exists, the page renders (top to bottom):
+
+1. Hero — [`hero-section.tsx`](src/components/landing/hero-section.tsx)
+2. Pain — [`pain-section.tsx`](src/components/landing/pain-section.tsx)
+3. Solution bridge — [`solution-bridge-section.tsx`](src/components/landing/solution-bridge-section.tsx)
+4. Social proof — [`social-proof-section.tsx`](src/components/landing/social-proof-section.tsx)
+5. Product — [`product-section.tsx`](src/components/landing/product-section.tsx)
+6. ROI — [`roi-section.tsx`](src/components/landing/roi-section.tsx)
+7. Urgency / intent — [`urgency-section.tsx`](src/components/landing/urgency-section.tsx)
+8. Objections — [`objection-section.tsx`](src/components/landing/objection-section.tsx)
+9. Trust bar — [`trust-bar.tsx`](src/components/landing/trust-bar.tsx)
+10. Final CTA — [`cta-section.tsx`](src/components/landing/cta-section.tsx)
+11. Personalization meta — [`personalization-meta.tsx`](src/components/landing/personalization-meta.tsx)
+12. SEO block — [`seo-block.tsx`](src/components/landing/seo-block.tsx)
+
+**SEO:** `generateMetadata` prefers titles/descriptions from landing JSON when present.
+
+### Access control & preview
+
+- **`LANDING_PAGE_SECRET`:** When set, [`landingTokenOk`](src/lib/landing-token.ts) requires `?t=` HMAC token matching the slug; otherwise **`notFound()`**. Empty secret → public pages.
+- **`?preview=true`:** Amber **Draft — Internal Preview Only** banner (cosmetic; does not enable Sanity draft mode).
+
+### Domain ↔ slug
+
+[`slugToDomain`](src/app/lp/[slug]/page.tsx): slugs may use hyphens (`example-com`) or dots (`example.com`).
 
 ## Environment Variables
 
-The frontend reads from `.env.local` (generated by `setup.sh` from the root `.env`):
+The frontend reads from `.env.local` (generated by [`../setup.sh`](../setup.sh) from the root `.env`):
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `NEXT_PUBLIC_API_URL` | Yes | Backend API base URL (browser-side requests) |
 | `INTERNAL_API_URL` | No | Backend URL for server-side requests (defaults to `NEXT_PUBLIC_API_URL`; set to `http://backend:8000` in Docker Compose) |
-| `NEXT_PUBLIC_SANITY_PROJECT_ID` | Yes | Sanity project ID for GROQ queries |
+| `NEXT_PUBLIC_SANITY_PROJECT_ID` | Yes* | Sanity project ID for GROQ fallback |
 | `NEXT_PUBLIC_SANITY_DATASET` | No | Sanity dataset (defaults to `production`) |
 | `SANITY_API_READ_TOKEN` | No | Sanity read token (falls back to `SANITY_API_TOKEN`) |
 | `LANDING_PAGE_SECRET` | No | HMAC secret for landing page access control |
+
+\*Required if you rely on Sanity fallback when `/api/landing/*` returns 404.
 
 ## Development
 
@@ -48,4 +77,8 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The backend API must be running at the configured `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`).
 
-For Docker, the frontend is built with `output: "standalone"` and runs via `node server.js` in production mode. See the root `docker-compose.yml`.
+For Docker, the frontend is built with `output: "standalone"` and runs via `node server.js` in production mode. See the root [`docker-compose.yml`](../docker-compose.yml).
+
+## Demo
+
+Submission Loom (pipeline end-to-end): [Recording](https://www.loom.com/share/03a0839c361c426eac5fd88edd70c20f).

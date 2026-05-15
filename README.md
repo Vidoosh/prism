@@ -2,7 +2,7 @@
 
 **Monorepo:** Python/FastAPI enrichment API, Next.js dashboard + personalized landing pages, Sanity CMS studio/schemas, HubSpot CRM custom company properties.
 
-Given any company URL, Prism scrapes the public website, enriches via LinkedIn and open-web research, runs a single structured Gemini call that acts as both analyst and copywriter, writes page-ready content blocks into Sanity, and updates HubSpot with ICP scoring, intent signals, and a link to the rendered landing page. The output is a personalized landing page an SDR can drop into an outbound email within minutes of running the pipeline.
+Given any company URL, Prism scrapes the public website **in parallel** with optional LinkedIn enrichment and Gemini-powered open-web research, runs a **structured Gemini enrichment pass** (analyst + CRM-ready copywriter), then a **second Gemini pass** that emits rich landing-page JSON stored on the pipeline run and exposed via the API. Results are written to **Sanity** (account profile + versioning) and **HubSpot** (`certify_*` properties + landing/Sanity links). The Next.js app renders **`/lp/{slug}`** using **API-first** landing content when present, with a **Sanity GROQ fallback** for older runs.
 
 ---
 
@@ -13,11 +13,13 @@ Given any company URL, Prism scrapes the public website, enriches via LinkedIn a
 3. [Handling Blocked and Thin-Content Sites](#handling-blocked-and-thin-content-sites)
 4. [Scaling to Hundreds of Accounts](#scaling-to-hundreds-of-accounts)
 5. [Gong and Salesforce Integration](#how-gong-and-salesforce-would-augment-the-pipeline)
-6. [Landing Page Rendering from Sanity](#landing-page-rendering-from-sanity)
-7. [Measurement](#measurement--connecting-pipeline-to-revenue)
-8. [Known Limitations](#known-limitations-and-future-improvements)
-9. [Quick Start](#quick-start)
-10. [Troubleshooting](#troubleshooting)
+6. [Landing Page Rendering](#landing-page-rendering)
+7. [API Endpoints](#api-endpoints)
+8. [Measurement](#measurement--connecting-pipeline-to-revenue)
+9. [Known Limitations](#known-limitations-and-future-improvements)
+10. [Quick Start](#quick-start)
+11. [Troubleshooting](#troubleshooting)
+12. [Demo (Loom)](#demo-loom)
 
 ---
 
@@ -26,30 +28,55 @@ Given any company URL, Prism scrapes the public website, enriches via LinkedIn a
 ```mermaid
 flowchart LR
   URL["Company URL"] --> Norm["Normalize"]
-  Norm --> Scrape["3-Tier Scrape\nhttpx → Playwright → Apify"]
-  Scrape --> LinkedIn["LinkedIn Enrichment\n(Apify)"]
-  LinkedIn --> WebRes["Web Research\nGemini 2.0 Flash +\nGoogle Search"]
-  WebRes --> AI["AI Analysis\nGemini 2.5 Flash Lite\n(single structured call)"]
-  AI --> Sanity["Sanity CMS\nupsert + versioning"]
-  AI --> HubSpot["HubSpot CRM\ncertify_* properties"]
-  Sanity --> LP["Next.js /lp/slug\npersonalized landing page"]
+  Norm --> Parallel["Parallel stages"]
+  Parallel --> Scrape["3-Tier Scrape\nhttpx → Playwright → Apify"]
+  Parallel --> LinkedIn["LinkedIn\nApify"]
+  Parallel --> WebRes["Web research\nGEMINI_GOOGLE_SEARCH_MODEL\nplus Google Search tool"]
+  Scrape --> Merge["Merge into ScrapedContent"]
+  LinkedIn --> Merge
+  WebRes --> Merge
+  Merge --> Enrich["Gemini enrichment\nGEMINI_MODEL\nstructured EnrichmentResult"]
+  Enrich --> LandingPass["Gemini landing JSON\nGEMINI_MODEL\noptional second pass"]
+  LandingPass --> Sanity["Sanity CMS\nupsert plus versioning"]
+  Enrich --> Sanity
+  LandingPass --> HubSpot["HubSpot CRM\ncertify_* properties"]
+  Enrich --> HubSpot
+  LandingPass --> ApiLanding["Backend GET /api/landing/{domain}"]
+  ApiLanding --> LP["Next.js /lp/slug"]
+  Sanity --> LP
 ```
 
-Each stage is independently resilient: a failure at any point triggers a dead-letter entry and graceful degradation rather than aborting the pipeline. The LinkedIn, web research, and AI stages all feed into the same structured `EnrichmentResult`, which is then written to both Sanity and HubSpot in parallel at the end.
+Each stage is independently resilient: failures enqueue dead-letter entries where applicable and degrade gracefully rather than aborting the entire flow. Scrape, LinkedIn, and web research results merge into `ScrapedContent`; enrichment produces `EnrichmentResult`; the landing pass produces JSON stored on the run (`landing_page_content`) and served by the API.
 
-**Key architectural principle:** the pipeline always writes *something* to both systems, even if upstream stages fail. A blocked scrape produces a low-confidence stub rather than silence. This means the CRM is never missing a record for a URL that was submitted, and the SDR always has visibility into what happened.
+**Key architectural principle:** the pipeline aims to leave visibility in CRM/CMS even when upstream stages fail (e.g. blocked scrape → low-confidence enrichment). Inspect each run’s `stages` array for per-stage success; the top-level run `status` is `"completed"` for most paths unless URL normalization fails early.
+
+**Assignment alignment:** The brief asks for a single LLM step acting as analyst plus copywriter for structured JSON — Prism satisfies that in the **enrichment pass** (ICP, intent, pain, hero/value prop/CTA blocks for Sanity and HubSpot). The **landing pass** is an extra PoC layer that turns that profile into a long-form page JSON without changing the core CRM/CMS contract.
 
 ---
 
 ## Design Decisions — What Was Built and Why
 
-### Single LLM call for analysis + content generation
+### Gemini vs Anthropic Claude (assignment vs implementation)
 
-**Decision:** One Gemini call performs ICP classification, intent signal detection, pain point mapping, *and* personalized content generation (hero headline, value prop, pain paragraph, CTA block) in a single pass.
+**Decision:** The role kickoff specifies Claude; this PoC uses **Google Gemini** — [`google-generativeai`](backend/ai/gemini_client.py) for enrichment + landing JSON, and [`google-genai`](backend/ai/web_research.py) with the **Google Search** tool for grounded web research.
 
-**Why:** A two-call approach (analyze, then generate) doubles API cost and latency without meaningfully improving quality. The analysis context (which ICP tier, which pain points, which hook technique) is exactly what the content generation needs — splitting them forces redundant context in the second prompt. The single-call approach uses a detailed output schema with 25+ required fields, and Gemini's native JSON mode (`response_mime_type: application/json`) enforces structure without needing a second validation pass.
+**Why:** Gemini gives native JSON mode for the enrichment schema, a supported tooling path for live search grounding, and Flash-tier economics at batch scale. The prompt engineering approach (structured analyst + copywriter role, defensive parsing) maps cleanly to Claude or other APIs if you swap SDK + model IDs.
 
-**What breaks:** If the prompt grows beyond ~8K input tokens (very content-rich sites), the model may truncate lower-priority output fields. The current mitigation is pre-processing each page to a 1,500-token budget before it reaches the LLM.
+### Primary Gemini enrichment pass (analyst + CRM copywriter)
+
+**Decision:** One structured Gemini call ingests merged scrape + LinkedIn + web research and returns JSON mapped to `EnrichmentResult`: ICP tier/score, intent signals, pain points, and Sanity/HubSpot content blocks (hero, value prop, pain paragraph, CTA, etc.).
+
+**Why:** A single enrichment payload keeps CRM and CMS contracts aligned — scoring and outbound copy stay mutually consistent. Gemini `response_mime_type: application/json` enforces shape; [`parse_enrichment_json`](backend/ai/response_parser.py) tolerates minor formatting drift.
+
+**What breaks:** Very rich sites may hit context limits — mitigated by summarizing each page to ~1,500 tokens before assembly.
+
+### Second Gemini pass: long-form landing JSON
+
+**Decision:** After enrichment succeeds, [`generate_landing_content`](backend/ai/gemini_client.py) runs a **second** Gemini call whose JSON is stored on the run as `landing_page_content` and served by [`GET /api/landing/{domain}`](backend/api/routes.py) (see [API Endpoints](#api-endpoints)).
+
+**Why:** Twelve on-page sections (below) would overload the enrichment schema and HubSpot property surface. Separating concerns keeps `EnrichmentResult` stable for Sanity/HubSpot while the frontend renders a deep LP from dedicated JSON.
+
+**Failure mode:** Landing failures enqueue dead-letter (`landing_page`) but **do not** fail the pipeline. The Next app falls back to Sanity GROQ + [`LegacyLanding`](frontend/src/components/landing/legacy-landing.tsx) when API landing JSON is absent.
 
 ### Pre-processing before LLM
 
@@ -57,11 +84,11 @@ Each stage is independently resilient: a failure at any point triggers a dead-le
 
 **Why:** Passing raw HTML wastes tokens on markup that carries no intelligence value. Pre-processing produces a consistent input schema regardless of how different companies structure their websites — the LLM always receives the same field names (`homepage_text`, `about_text`, `career_titles`, `blog_excerpts`, `press_excerpts`) with quality metadata (`scrape_quality`, `pages_blocked`, `thin_content_pages`). This makes prompt engineering stable and reproducible.
 
-### Gemini model selection
+### Model configuration (`GEMINI_MODEL`, `GEMINI_GOOGLE_SEARCH_MODEL`)
 
-**Decision:** Gemini 2.5 Flash Lite for primary enrichment; Gemini 2.0 Flash with Google Search tool for open-web research.
+**Decision:** Model IDs are **environment-driven**. [`config.py`](backend/config.py) defaults both `GEMINI_MODEL` and `GEMINI_GOOGLE_SEARCH_MODEL` to `gemini-2.5-flash-lite`; [`.env.example`](.env.example) may pin newer Flash SKUs (e.g. `gemini-3.1-flash-lite`) — use whichever your Google AI project exposes.
 
-**Why:** Flash Lite is cost-optimized for structured output tasks — at the scale of hundreds of accounts, the per-company cost stays under $0.02. The separate web research call uses Gemini 2.0 Flash because it supports Google Search grounding (tool use), which lets the model query live search results for news, funding, M&A, and hiring signals that aren't on the company's own website. This two-model approach gives the enrichment call access to both scraped website data *and* live open-web intelligence without requiring the primary model to have tool-use capabilities.
+**Why:** Web research requires the **`google-genai`** client with **`GoogleSearch`** grounding; enrichment + landing use **`google-generativeai`**. Keeping IDs in `.env` avoids code churn when Google rotates model names.
 
 ### Sanity document identity: `_id = account-{domain}`
 
@@ -95,9 +122,9 @@ The five `productPageContent` seed documents (`product-credentialing`, `product-
 
 ### Web research via Gemini + Google Search grounding
 
-**Decision:** A separate Gemini 2.0 Flash call with Google Search tool access generates a structured dossier of open-web intelligence about the target company.
+**Decision:** A dedicated call using **`GEMINI_GOOGLE_SEARCH_MODEL`** and the Google Search tool ([`research_domain_with_google_search`](backend/ai/web_research.py)) produces structured open-web intelligence.
 
-**Why:** The company's own website only tells one side of the story. News articles reveal funding rounds, M&A activity, geographic expansions, leadership changes, regulatory incidents, and competitive positioning — all high-value intent signals that scraping the website alone would miss. The web research dossier is passed as `web_research` in the enrichment prompt, letting the primary analysis cross-reference scraped data with external corroboration.
+**Why:** Sites omit timing-sensitive signals (funding, exec moves, incidents). Grounded search complements scrape + LinkedIn; results merge into `ScrapedContent.web_research` for the enrichment prompt.
 
 ---
 
@@ -143,7 +170,7 @@ The pipeline is designed around the assumption that real-world scraping will enc
 
 ### Sanity / HubSpot API failures
 
-**Handling:** All API writes use retry logic (Sanity: retries at 0, 2, 4, 8s intervals; HubSpot: single retry with field-stripping on `INVALID_OPTION` errors). On terminal failure, the enrichment JSON is persisted to `failed_writes/{timestamp}-{domain}.json` as a dead-letter entry. The API exposes `GET /api/dead-letter` and `POST /api/dead-letter/{id}/retry` endpoints for manual recovery. The pipeline continues past write failures and still marks the run as `"completed"` — inspect the `stages` array on each result for per-stage success/failure detail.
+**Handling:** All API writes use retry logic (Sanity: retries at 0, 2, 4, 8s intervals; HubSpot: single retry with field-stripping on `INVALID_OPTION` errors). On terminal failure, the enrichment JSON is persisted to `failed_writes/{timestamp}-{domain}.json` as a dead-letter entry. The API exposes `GET /api/dead-letter` and `POST /api/dead-letter/{entry_id}/retry` endpoints for manual recovery. The pipeline continues past write failures and still marks the run as `"completed"` — inspect the `stages` array on each result for per-stage success/failure detail.
 
 ---
 
@@ -163,9 +190,9 @@ At 500 companies x ~10 pages each = ~5,000 HTTP requests, the primary bottleneck
 
 ### LLM throughput
 
-Each company produces one Gemini enrichment call (~3,000-5,000 input tokens, ~2,000 output tokens) plus one optional web research call. At concurrency 3, this generates ~6 API calls in flight at any time — well within Gemini's rate limits for standard API keys. The `asyncio.to_thread` wrapper ensures the synchronous `google-generativeai` SDK doesn't block the event loop.
+Per successful company run with `GEMINI_API_KEY` set: **one optional grounded web-research call** (`google-genai` + Google Search), **one enrichment call** (`google-generativeai`, structured JSON), and **one landing-page JSON call** when enrichment succeeds — roughly **three** Gemini-facing requests per domain at peak (fewer if keys/tokens omit stages). At batch concurrency 3, budget sustained RPM against your Google quota accordingly. Blocking operations run via `asyncio.to_thread` so the event loop stays responsive.
 
-For bulk runs exceeding 1,000 companies, Gemini's Batch API would reduce cost by ~50% by processing requests asynchronously at lower priority. The pipeline architecture (decoupled scrape → enrich → write stages) already supports this — the enrichment stage could be swapped to batch mode without changing the scraping or writing stages.
+For bulk runs exceeding ~1,000 companies, Gemini's Batch API could lower cost for the enrichment pass; scrape → enrich → write separation keeps that swap localized.
 
 ### HubSpot API limits
 
@@ -178,11 +205,12 @@ HubSpot limits API calls to 100 requests per 10 seconds on free/starter tiers. T
 | Scraping (httpx/Playwright) | ~$0 | ~$0 |
 | Scraping (Apify, ~5% of sites) | ~$0.002 | ~$0.50 |
 | LinkedIn enrichment (Apify) | ~$0.003 | ~$1.50 |
-| Web research (Gemini 2.0 Flash) | ~$0.003 | ~$1.50 |
-| AI enrichment (Gemini 2.5 Flash Lite) | ~$0.008 | ~$4.00 |
+| Web research (`GEMINI_GOOGLE_SEARCH_MODEL`) | ~$0.003 | ~$1.50 |
+| AI enrichment (`GEMINI_MODEL`) | ~$0.008 | ~$4.00 |
+| Landing JSON (`GEMINI_MODEL`) | ~$0.004–0.008 | ~$2–4 |
 | Sanity writes | negligible (free tier) | $0 |
 | HubSpot writes | negligible (API-based) | $0 |
-| **Total** | **~$0.01–0.02** | **~$5–8** |
+| **Total** | **~$0.015–0.03** | **~$8–12** |
 
 ### What breaks first at scale
 
@@ -268,15 +296,37 @@ Signals from Gong override inferences from scraping. Salesforce stage overrides 
 
 ---
 
-## Landing Page Rendering from Sanity
+## Landing Page Rendering
 
-The Sanity document is not just a storage layer — it is the content source for dynamically rendered, account-specific landing pages that SDRs include in outbound emails.
+Personalized landing pages live at **`/lp/{slug}`** (e.g. `/lp/example-health-com`). Implementation: [`frontend/src/app/lp/[slug]/page.tsx`](frontend/src/app/lp/[slug]/page.tsx).
 
-### How it works
+### API-first JSON + Sanity fallback
 
-Each company gets a landing page at `/lp/{slug}` (e.g., `/lp/example-health-com`). The route is a Next.js server component that queries the Sanity Content Lake at request time for the matching `accountResearchProfile` document.
+**Primary path:** The Next.js server loads **`GET /api/landing/{domain}`** (same origin via [`INTERNAL_API_URL`](frontend/src/lib/api.ts) / `NEXT_PUBLIC_API_URL`), which returns the **`landing_page_content`** stored on the latest [`PipelineRunResult`](backend/models/schemas.py). That JSON drives **twelve** React sections under [`frontend/src/components/landing/`](frontend/src/components/landing/).
 
-**GROQ query:**
+**Fallback:** If the API returns 404 (no landing JSON — e.g. landing stage skipped or failed), the route loads Sanity via GROQ ([`frontend/src/lib/sanity.ts`](frontend/src/lib/sanity.ts)) and renders **`LegacyLanding`** — roughly the earlier five-block layout built from `accountResearchProfile`.
+
+### Twelve-section layout (rich LP)
+
+When API landing JSON is present, sections render in order:
+
+1. **Hero** — headline/value framing (`HeroSection`)
+2. **Pain** — narrative + proof (`PainSection`)
+3. **Solution bridge** — positioning (`SolutionBridgeSection`)
+4. **Social proof** — logos/stories (`SocialProofSection`)
+5. **Product** — capability depth (`ProductSection`)
+6. **ROI** — economics (`RoiSection`)
+7. **Urgency / intent** — timing (`UrgencySection`)
+8. **Objections** — preemptive answers (`ObjectionSection`)
+9. **Trust bar** — credibility chips (`TrustBar`)
+10. **Final CTA** — conversion (`FinalCtaSection`)
+11. **Personalization meta** — internal ribbon (`PersonalizationMetaRibbon`)
+12. **SEO block** — optional crawl-oriented copy (`SeoBlock`)
+
+**Metadata:** [`generateMetadata`](frontend/src/app/lp/[slug]/page.tsx) prefers titles/descriptions from landing JSON when present.
+
+### Sanity GROQ (fallback query)
+
 ```groq
 *[_type == "accountResearchProfile" && domain == $domain][0]{
   company_name,
@@ -294,27 +344,39 @@ Each company gets a landing page at `/lp/{slug}` (e.g., `/lp/example-health-com`
 }
 ```
 
-### Page template assembly
-
-The landing page composes five sections from the enrichment data:
-
-1. **Hero section** — `content_blocks.hero_headline` and `content_blocks.personalized_value_proposition`, personalized to reflect the company's specific operational context.
-2. **Pain section** — `content_blocks.pain_point_paragraph` plus the detected `pain_points` array with severity levels and evidence.
-3. **Social proof section** — CertifyOS case studies and metrics matched by `organization_type` (health plan companies see health plan customer testimonials; digital health companies see digital health success metrics).
-4. **Product section** — Feature details pulled from the first resolved `productPageContent` document referenced in `primary_product_fit`, ensuring the product pitch matches the company's primary pain.
-5. **CTA section** — `content_blocks.cta_block` with personalized CTA text, subtext, and a supporting proof point.
-
 ### URL design and access control
 
-**Slug format:** The domain is converted to a hyphenated slug (`example.com` → `example-com`). This is human-readable but not easily guessable — a prospect can't enumerate other companies' landing pages.
+**Slug format:** Hyphenated domain (`example.com` → `example-com`). [`slugToDomain`](frontend/src/app/lp/[slug]/page.tsx) accepts either dotted or hyphenated slugs.
 
-**Optional HMAC token:** When `LANDING_PAGE_SECRET` is set, pages require a `?t={token}` parameter. The token is an HMAC-SHA256 of the slug with the secret (first 20 hex characters). If no secret is set, all pages are publicly accessible. This lets teams gate pages during internal review and selectively share live links.
+**Optional HMAC token:** When **`LANDING_PAGE_SECRET`** is set, requests must include **`?t=`** — see [`frontend/src/lib/landing-token.ts`](frontend/src/lib/landing-token.ts). If unset, pages are publicly reachable.
 
-**Preview mode:** Appending `?preview=true` renders the page with a "Draft — Internal Preview Only" banner, letting SDRs verify the personalization before including the URL in outreach.
+**Preview:** **`?preview=true`** shows an amber **Draft — Internal Preview Only** banner (does not toggle Sanity draft mode).
 
-### The rendering trigger
+### Trigger from outbound
 
-The pipeline writes `certify_sanity_content_url` and the landing page URL to the HubSpot company record. The SDR includes this URL in their outbound email. When the prospect clicks the link, they land on a page that feels built specifically for them — because the intelligence layer made it so.
+The pipeline writes **`certify_sanity_content_url`**, Sanity Studio deep links, and a **`landing_page_url`** derived from **`FRONTEND_URL`** + `/lp/{slug}` so reps can paste one outbound link — prospects hit API-backed LP JSON or legacy Sanity-backed UI depending on run outcome.
+
+---
+
+## API Endpoints
+
+FastAPI routes ([`backend/api/routes.py`](backend/api/routes.py)); interactive docs at **`/docs`**.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Service metadata |
+| POST | `/api/pipeline/run` | Body `{ "url": "..." }`; enqueue pipeline; returns `{ "run_id" }` |
+| GET | `/api/pipeline/status/{run_id}` | Full run JSON from disk |
+| POST | `/api/pipeline/batch` | Multipart CSV upload; returns `{ "batch_id" }` |
+| GET | `/api/pipeline/batch/{batch_id}` | Batch progress JSON |
+| GET | `/api/results` | Paginated runs (`limit`, `offset`) |
+| GET | `/api/results/{domain}` | Latest run for domain (supports slug-style domains) |
+| GET | `/api/landing/{domain}` | **`landing_page_content`** JSON only |
+| GET | `/api/dead-letter` | Dead-letter queue listing |
+| POST | `/api/dead-letter/{entry_id}/retry` | Re-run pipeline from queued payload |
+| POST | `/api/setup/hubspot` | Ensure HubSpot `certify_*` properties (needs token) |
+| POST | `/api/setup/sanity` | Seed product docs |
+| GET | `/api/health` | Liveness `{ "status": "ok" }` |
 
 ---
 
@@ -355,14 +417,14 @@ A pipeline that generates personalized content is only valuable if it impacts pi
 - **Content requires human review.** The personalized content blocks are LLM-generated and should be reviewed by an SDR before external use. The `requires_review` flag and `data_confidence` levels help prioritize which accounts need more attention.
 - **Provider count estimation is imprecise.** For companies that don't explicitly state their network size, the LLM infers from indirect signals (language like "hundreds of providers," employee count proxies). This inference is flagged in `confidence_rationale`.
 - **HubSpot workflows are not automated in the PoC.** The `certify_*` properties support workflow triggers (Tier-A SDR alert, Tier-B nurture enrollment, 90-day re-enrichment reminder), but these must be configured in the HubSpot UI.
-- **Social proof on landing pages is static.** The social proof section uses hardcoded case studies matched by organization type rather than pulling from a dynamic Sanity collection.
-- **Landing page preview is cosmetic.** The `?preview=true` flag adds a visual banner but doesn't use Sanity's draft/preview API. Both preview and live pages render the same published content.
+- **Social proof / layout differs by path.** Rich LP social proof comes from landing JSON when present; **`LegacyLanding`** still blends hardcoded proof patterns tied to `organization_type`.
+- **Landing preview is cosmetic.** `?preview=true` adds a banner only; neither path toggles Sanity draft preview APIs — published vs preview uses the same fetched documents/run payloads.
 
 ---
 
 ## Quick Start
 
-1. Copy [`.env.example`](.env.example) → `.env` and fill secrets.
+1. Copy [`.env.example`](.env.example) → `.env` and fill secrets (**minimum:** `GEMINI_API_KEY`, Sanity IDs/tokens; **HubSpot:** `HUBSPOT_ACCESS_TOKEN` Private App token starting with `pat-` for CRM writes).
 2. `chmod +x setup.sh && ./setup.sh` (local venv + npm installs), **or** `docker compose up --build`.
 3. **One-time setup (with tokens in `.env`):**
    - `curl -X POST http://localhost:8000/api/setup/hubspot` — create `certify_*` properties.
@@ -388,6 +450,12 @@ Account docs reference `productPageContent` IDs. The pipeline auto-seeds those f
 ### HubSpot `401` / `EXPIRED_AUTHENTICATION` with `1970-01-01`
 
 Usually means `HUBSPOT_ACCESS_TOKEN` is missing, wrong, or not a Private App token. Use a current token from **Settings → Integrations → Private Apps** (starts with `pat-`). Remove quotes/spaces in `.env`, restart uvicorn.
+
+---
+
+## Demo (Loom)
+
+Submission demo (two companies, pipeline end-to-end): [Loom recording](https://www.loom.com/share/03a0839c361c426eac5fd88edd70c20f).
 
 ---
 
