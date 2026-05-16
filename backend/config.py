@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     backend_url: str = Field(default="http://localhost:8000", alias="BACKEND_URL")
     frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
+    port: int = Field(default=8000, alias="PORT")
 
     gemini_model: str = Field(default="gemini-2.5-flash-lite", alias="GEMINI_MODEL")
     # Model for Gemini + Google Search grounding (google-genai SDK)
