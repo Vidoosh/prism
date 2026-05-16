@@ -198,6 +198,7 @@ class SanityAccountProfile(BaseModel):
     pipeline_run_id: str = ""
     enrichment_version: int = 1
     landing_page_url: str = ""
+    landing_page_content: Optional[str] = None
     sanity_document_url: str = ""
 
     model_config = ConfigDict(populate_by_name=True)

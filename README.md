@@ -17,8 +17,8 @@ Given any company URL, Prism scrapes the public website **in parallel** with opt
 7. [API Endpoints](#api-endpoints)
 8. [Measurement](#measurement--connecting-pipeline-to-revenue)
 9. [Known Limitations](#known-limitations-and-future-improvements)
-10. [Quick Start](#quick-start)
-11. [Troubleshooting](#troubleshooting)
+10. [Production deployment](#production-deployment)
+11. [Quick Start](#quick-start)
 12. [Demo (Loom)](#demo-loom)
 
 ---
@@ -422,6 +422,22 @@ A pipeline that generates personalized content is only valuable if it impacts pi
 
 ---
 
+## Production deployment
+
+The stack is **not** deployable as a single Vercel project: the backend is FastAPI + Playwright + **disk-backed** run storage and **background jobs**, which require a container host with persistent volumes (or a database migration).
+
+Deploy **three surfaces**:
+
+| Piece | Typical host |
+|-------|----------------|
+| [`frontend/`](frontend/) (Next.js 15) | **Vercel** — root directory `prism/frontend` |
+| [`backend/`](backend/) (FastAPI) | **Railway / Render / Fly.io / Cloud Run** — use [`backend/Dockerfile`](backend/Dockerfile); persist `storage/` and `failed_writes/` |
+| [`sanity/`](sanity/) (Studio) | **`npx sanity deploy`** (Sanity-hosted) — see [`sanity/README.md`](sanity/README.md) |
+
+Step-by-step instructions, env vars, and CORS notes: **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
+---
+
 ## Quick Start
 
 1. Copy [`.env.example`](.env.example) → `.env` and fill secrets (**minimum:** `GEMINI_API_KEY`, Sanity IDs/tokens; **HubSpot:** `HUBSPOT_ACCESS_TOKEN` Private App token starting with `pat-` for CRM writes).
@@ -441,17 +457,6 @@ A pipeline that generates personalized content is only valuable if it impacts pi
 
 ---
 
-## Troubleshooting
-
-### Sanity `409` — `documentReferenceDoesNotExistError`
-
-Account docs reference `productPageContent` IDs. The pipeline auto-seeds those five product documents in the same mutation batch, so a fresh pull should fix this without running setup manually. If you still see 409s, confirm `SANITY_PROJECT_ID` / `SANITY_DATASET` match the project where you expect data.
-
-### HubSpot `401` / `EXPIRED_AUTHENTICATION` with `1970-01-01`
-
-Usually means `HUBSPOT_ACCESS_TOKEN` is missing, wrong, or not a Private App token. Use a current token from **Settings → Integrations → Private Apps** (starts with `pat-`). Remove quotes/spaces in `.env`, restart uvicorn.
-
----
 
 ## Demo (Loom)
 

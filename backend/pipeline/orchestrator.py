@@ -462,6 +462,7 @@ async def run_pipeline(source_url: str, run_id: str | None = None) -> PipelineRu
                 landing,
                 sanity_doc,
                 rid,
+                landing_page_content=result.landing_page_content,
             )
             result.sanity_document_id = f"account-{domain}"
             logger.info(

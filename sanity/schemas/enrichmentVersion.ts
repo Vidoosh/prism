@@ -63,5 +63,10 @@ export default defineType({
         defineField({ name: "hook_technique_used", type: "string" }),
       ],
     }),
+    defineField({
+      name: "landing_page_content",
+      title: "Landing Page Content (JSON)",
+      type: "text",
+    }),
   ],
 });

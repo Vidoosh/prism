@@ -65,6 +65,7 @@ def build_account_document(
     pipeline_run_id: str,
     enrichment_version: int,
     prior: Optional[dict[str, Any]],
+    landing_page_content: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     if prior and prior.get("first_enriched_at"):
@@ -149,6 +150,14 @@ def build_account_document(
         "landing_page_url": landing_page_url,
         "sanity_document_url": sanity_studio_url,
     }
+
+    if landing_page_content is not None:
+        doc["landing_page_content"] = json.dumps(landing_page_content, ensure_ascii=False)
+    elif prior:
+        prev_lp = prior.get("landing_page_content")
+        if isinstance(prev_lp, str) and prev_lp.strip():
+            doc["landing_page_content"] = prev_lp
+
     return doc
 
 
@@ -194,6 +203,7 @@ async def upsert_account_with_history(
     landing_page_url: str,
     sanity_studio_url: str,
     pipeline_run_id: str,
+    landing_page_content: Optional[dict[str, Any]] = None,
 ) -> int:
     settings = get_settings()
     if not settings.sanity_project_id or not settings.sanity_api_token:
@@ -226,6 +236,7 @@ async def upsert_account_with_history(
             "intent_signals": prior.get("intent_signals"),
             "pain_points": prior.get("pain_points"),
             "content_blocks": prior.get("content_blocks"),
+            "landing_page_content": prior.get("landing_page_content"),
         }
         mutations.append({"create": snapshot})
 
@@ -239,6 +250,7 @@ async def upsert_account_with_history(
         pipeline_run_id,
         version,
         prior,
+        landing_page_content=landing_page_content,
     )
     mutations.append({"createOrReplace": doc})
 

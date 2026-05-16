@@ -144,6 +144,12 @@ export default defineType({
     defineField({ name: "pipeline_run_id", type: "string" }),
     defineField({ name: "enrichment_version", type: "number" }),
     defineField({ name: "landing_page_url", type: "url" }),
+    defineField({
+      name: "landing_page_content",
+      title: "Landing Page Content (JSON)",
+      type: "text",
+      description: "Serialized JSON from the second Gemini landing page pass",
+    }),
     defineField({ name: "sanity_document_url", type: "url" }),
   ],
   preview: { select: { title: "company_name", subtitle: "domain" } },
