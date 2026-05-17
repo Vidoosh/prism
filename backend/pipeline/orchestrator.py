@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ai.gemini_client import enrich_stub, enrich_with_gemini, generate_landing_content
-from ai.response_parser import parse_enrichment_json
+from ai.response_parser import parse_enrichment_json, parse_json_object
 from ai.web_research import research_domain_with_google_search
 from config import get_settings
 from integrations.hubspot_client import upsert_company_record
@@ -384,9 +384,7 @@ async def run_pipeline(source_url: str, run_id: str | None = None) -> PipelineRu
             )
             payload = json.dumps(enrichment.model_dump(mode="json"), ensure_ascii=False)
             raw_lp = await asyncio.to_thread(generate_landing_content, payload, domain)
-            parsed = json.loads(raw_lp)
-            if not isinstance(parsed, dict):
-                raise ValueError("landing page JSON root must be an object")
+            parsed = parse_json_object(raw_lp)
             result.landing_page_content = parsed
             stages.append(StageStatus(stage="landing_page", ok=True, duration_ms=_ms(t_lp)))
             logger.info(

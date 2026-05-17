@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 import time
 from typing import Any, Optional
 
 from google import genai
 from google.genai import types
+
+from ai.response_parser import parse_json_object
 
 from ai.prompts import (
     GOOGLE_SEARCH_RESEARCH_SYSTEM_INSTRUCTION,
@@ -18,29 +18,6 @@ from ai.prompts import (
 from config import get_settings
 
 logger = logging.getLogger(__name__)
-
-_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-
-
-def _parse_json_object(text: str) -> dict[str, Any]:
-    """Parse a single JSON object from model output; tolerate markdown fences."""
-    raw = (text or "").strip()
-    if not raw:
-        raise ValueError("empty response")
-    m = _JSON_FENCE.search(raw)
-    if m:
-        raw = m.group(1).strip()
-    try:
-        out = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        out = json.loads(raw[start : end + 1])
-    if not isinstance(out, dict):
-        raise TypeError("expected JSON object")
-    return out
 
 
 def research_domain_with_google_search(domain: str, source_url: str) -> Optional[dict[str, Any]]:
@@ -90,7 +67,7 @@ def research_domain_with_google_search(domain: str, source_url: str) -> Optional
             if not text:
                 last_err = RuntimeError("Empty Gemini web_research response")
                 continue
-            parsed = _parse_json_object(text)
+            parsed = parse_json_object(text)
             logger.info(
                 "[web_research] ok attempt=%s domain=%s keys=%s",
                 attempt + 1,

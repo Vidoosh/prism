@@ -54,6 +54,30 @@ def strip_fences(text: str) -> str:
     return t.strip()
 
 
+_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Parse a single JSON object from model output; tolerate markdown fences."""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty response")
+    m = _JSON_FENCE.search(raw)
+    if m:
+        raw = m.group(1).strip()
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        out = json.loads(raw[start : end + 1])
+    if not isinstance(out, dict):
+        raise TypeError("expected JSON object")
+    return out
+
+
 def _derive_pain_severity(pains: list[PainPoint]) -> str:
     order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
     best = 0
